@@ -331,25 +331,6 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         i = self.match_parameter(name)
         self._frozen[i] = False
 
-    @staticmethod
-    def parameter_sort(f):
-        if f.__name__ == "get_value_and_gradient":
-            def func(self, *args, **kwargs):
-                value, gradient = f(self, *args, **kwargs)
-                return value, self._sort(gradient)
-        elif f.__name__ == "get_gradient":
-            def func(self, *args, **kwargs):
-                return self._sort(f(self, *args, **kwargs))
-        return func
-
-    def _sort(self, values):
-        ret = [values[k] for k in self.get_parameter_names()]
-        # Horrible hack to only return numpy array if that's what was
-        # given by the wrapped function.
-        if len(ret) and type(ret[0]).__module__ == np.__name__:
-            return np.vstack(ret)
-        return ret
-
     def get_value(self, *args, **kwargs):
         raise NotImplementedError("sublasses must implement the 'get_value' "
                                   "method")
@@ -376,6 +357,36 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
             grad[i] = (value - value0) / eps
         return grad
 
+    @staticmethod
+    def parameter_sort(f):
+        if f.__name__ == "get_value_and_gradient":
+            def func(self, *args, **kwargs):
+                value, gradient = f(self, *args, **kwargs)
+                return value, self._sort(gradient)
+        elif f.__name__ == "get_gradient":
+            def func(self, *args, **kwargs):
+                return self._sort(f(self, *args, **kwargs))
+        return func
+
+    def _sort(self, values):
+        ret = [values[k] for k in self.get_parameter_names()]
+        # Horrible hack to only return numpy array if that's what was
+        # given by the wrapped function.
+        if len(ret) and type(ret[0]).__module__ == np.__name__:
+            return np.vstack(ret)
+        return ret
+
+
+class reparameterization(object):
+
+    def __init__(self, depends=None):
+        self.depends = depends
+
+    def __call__(self, f):
+        def wrapped(*args, **kwargs):
+            return f(*args, **kwargs)
+        return wrapped
+
 
 class Model(ModelMixin):
 
@@ -387,13 +398,9 @@ class Model(ModelMixin):
         inv_sig = np.exp(-self.log_sigma)
         return self.amp*np.exp(-np.sum((x-self.mu)**2)*inv_sig)
 
-    @ModelMixin.parameter_sort
-    def get_value_and_gradient(self, x):
-        value = self.get_value(x)
-        return value, dict(
-            amp=value / self.amp,
-            mu=value
-        )
+    @reparameterization(depends=[log_sigma])
+    def inv_sigma(self):
+        return np.exp(-self.log_sigma)
 
 
 if __name__ == "__main__":
