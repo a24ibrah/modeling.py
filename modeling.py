@@ -383,8 +383,10 @@ class reparameterization(object):
         self.depends = depends
 
     def __call__(self, f):
+        print(self.depends)
         def wrapped(*args, **kwargs):
             return f(*args, **kwargs)
+        wrapped.__reparameterization_depends__ = self.depends
         return wrapped
 
 
