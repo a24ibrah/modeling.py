@@ -15,7 +15,7 @@ __contributors__ = [
 import copy
 import logging
 import fnmatch
-from collections import OrderedDict
+from collections import OrderedDict, Iterable
 
 import numpy as np
 from six import with_metaclass, iteritems
@@ -48,16 +48,28 @@ class Parameter(object):
     # to models. The point of this is to force a model to always have a
     # deterministic parameter order. In practice, the ordering is enforced by
     # the ``ModelMeta`` metaclass.
-    _creation_counter = 0
+    __creation_counter__ = 0
 
-    def __init__(self, size=0, default=None, bounds=None, frozen=False):
-        self._creation_order = Parameter._creation_counter
-        Parameter._creation_counter += 1
+    def __init__(self, size=0, default=None, bounds=None, frozen=False,
+                 depends=None):
+        self._creation_order = Parameter.__creation_counter__
+        Parameter.__creation_counter__ += 1
 
         self.default = default
         self.bounds = bounds
         self.size = size
         self.frozen = frozen
+
+        # Build the dependency tree.
+        self.dependents = []
+        if depends is not None:
+            if not isinstance(depends, Iterable):
+                depends = [depends]
+            [p.add_dependent(self) for p in depends]
+        self.depends = depends
+
+        # Caching.
+        self.value = None
 
         # Check the bounds.
         if bounds is None:
@@ -101,6 +113,41 @@ class Parameter(object):
             return np.nan
         return self.default
 
+    def add_dependent(self, param):
+        self.dependents.append(param)
+
+    def getter(self, func):
+        self._getter = func
+
+    def setter(self, func):
+        self._setter = func
+
+    def reset(self):
+        print("reset {0}".format(self.default))
+        self.value = None
+        [p.reset() for p in self.dependents]
+
+    @property
+    def has_getter(self):
+        return hasattr(self, "_getter")
+
+    def get_value(self, model):
+        print("face")
+        if self.depends is None or self.value is None:
+            print("face2")
+            self.value = self._getter(model)
+        return self.value
+
+    @property
+    def has_setter(self):
+        return hasattr(self, "_setter")
+
+    def set_value(self, model, value):
+        print(self.dependents)
+        [p.reset() for p in self.dependents]
+        self.value = value
+        self._setter(model, value)
+
 
 class ModelMeta(type):
     """
@@ -122,9 +169,13 @@ class ModelMeta(type):
         # These will form the basis of the modeling protocol by exposing the
         # parameter names and other available settings.
         parameters = []
+        reparams = []
         for name, obj in iteritems(dct):
             if isinstance(obj, Parameter):
-                parameters.append((name, copy.deepcopy(obj)))
+                if obj.has_getter:
+                    reparams.append((name, copy.deepcopy(obj)))
+                else:
+                    parameters.append((name, copy.deepcopy(obj)))
 
         # The parameters are ordered by their creation order (i.e. the order
         # that they appear in the class definition) so that the `vector` will
@@ -132,10 +183,15 @@ class ModelMeta(type):
         dct["__parameters__"] = parameters = OrderedDict(
             sorted(parameters, key=lambda o: o[1]._creation_order)
         )
+        dct["__reparams__"] = reparams = OrderedDict(
+            sorted(reparams, key=lambda o: o[1]._creation_order)
+        )
 
         # Remove the parameter definitions from the namespace so they can be
         # overwritten.
         for k in parameters:
+            dct.pop(k)
+        for k in reparams:
             dct.pop(k)
 
         return super(ModelMeta, cls).__new__(cls, name, parents, dct)
@@ -184,7 +240,7 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
 
     def __init__(self, **kwargs):
         for k, v in iteritems(kwargs):
-            if k not in self.__parameters__:
+            if k not in self.__parameters__ and k not in self.__reparams__:
                 raise ValueError("unrecognized parameter '{0}'".format(k))
             setattr(self, k, v)
 
@@ -210,18 +266,33 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         return "{0}({1})".format(self.__class__.__name__, args.format(self))
 
     def __getattr__(self, name):
-        if self.__parameters__ is None or name not in self.__parameters__:
+        if self.__parameters__ is None:
             raise AttributeError(name)
 
         o = self.__parameters__.get(name, None)
+        if o is None:
+            if name not in self.__reparams__:
+                raise AttributeError(name)
+            return self.__reparams__[name].get_value(self)
         return self._vector[o.index]
 
     def __setattr__(self, name, value):
-        if self.__parameters__ is None or name not in self.__parameters__:
+        if self.__parameters__ is None:
             return super(ModelMixin, self).__setattr__(name, value)
 
         o = self.__parameters__.get(name, None)
-        self._vector[o.index] = value
+        if o is None:
+            o = self.__reparams__.get(name, None)
+            if o is None:
+                return super(ModelMixin, self).__setattr__(name, value)
+            if not o.has_setter:
+                raise AttributeError("'{0}' is read-only".format(name))
+            o.set_value(self, value)
+        else:
+            self._vector[o.index] = value
+
+        # Make sure that any dependent parameters get reset.
+        [p.reset() for p in o.dependents]
 
     def __getitem__(self, k):
         return self.get_parameter(k)
@@ -251,6 +322,7 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         return self._vector[~self._frozen]
 
     def set_vector(self, value, full=False):
+        [p.reset() for p in self.__reparams__.values()]
         if full:
             self._vector[:] = value
         else:
@@ -377,47 +449,57 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         return ret
 
 
-class reparameterization(object):
-
-    def __init__(self, depends=None):
-        self.depends = depends
-
-    def __call__(self, f):
-        print(self.depends)
-        def wrapped(*args, **kwargs):
-            return f(*args, **kwargs)
-        wrapped.__reparameterization_depends__ = self.depends
-        return wrapped
-
-
 class Model(ModelMixin):
 
     amp = Parameter(frozen=True, default=0.1, bounds=(-10, 10))
     mu = Parameter(size=3)
-    log_sigma = Parameter()
+    log_sigma = Parameter(default=1)
+
+    # Reparameterizations.
+    sigma = Parameter(default=2, depends=log_sigma)
+    inv_sigma = Parameter(default=3, depends=sigma)
 
     def get_value(self, x):
-        inv_sig = np.exp(-self.log_sigma)
-        return self.amp*np.exp(-np.sum((x-self.mu)**2)*inv_sig)
+        return self.amp*np.exp(-np.sum((x-self.mu)**2)*self.inv_sigma)
 
-    @reparameterization(depends=[log_sigma])
-    def inv_sigma(self):
-        return np.exp(-self.log_sigma)
+    @sigma.getter
+    def get_sigma(self):
+        return np.exp(self.log_sigma)
+
+    @sigma.setter
+    def set_sigma(self, value):
+        self.log_sigma = np.log(value)
+
+    @inv_sigma.getter
+    def get_inv_sigma(self):
+        return 1.0 / self.sigma
 
 
 if __name__ == "__main__":
-    m = Model(log_sigma=1.0, mu=0.0)
-    print(m)
-    print(m.get_bounds())
-    print(m.get_vector())
-    print(m.get_parameter_names(full=True))
-    m.thaw_parameter("amp")
+    m = Model(sigma=1.0, mu=0.0)
+    print(m.log_sigma)
+    print(m.sigma)
+    print(m.inv_sigma)
+    # print(m.inv_sigma)
+
+    m.sigma = 10.0
+    print(m.log_sigma)
+    print(m.sigma)
+    print(m.inv_sigma)
+    # print(np.exp(-m.log_sigma))
+    # print(m.get_parameter_names())
+
+    # print(m)
+    # print(m.get_bounds())
+    # print(m.get_vector())
+    # print(m.get_parameter_names(full=True))
+    # m.thaw_parameter("amp")
+
+    # m2 = Model(log_sigma=10.0, mu=.5)
+    # print(m2._vector)
+    # print(m2.log_sigma)
 
     print(m.get_value(0.1))
+    # print(m2.get_value(0.1))
 
-    m2 = Model(log_sigma=10.0, mu=10.0)
-    print(m2._vector)
-    print(m2.log_sigma)
-
-    print(m._vector)
-    print(m.log_sigma)
+    print(m.get_gradient(0.1))
