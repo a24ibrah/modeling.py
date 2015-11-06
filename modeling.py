@@ -50,11 +50,12 @@ class Parameter(object):
     # the ``ModelMeta`` metaclass.
     __creation_counter__ = 0
 
-    def __init__(self, size=0, default=None, bounds=None, frozen=False,
-                 depends=None):
+    def __init__(self, name=None, size=0, default=None, bounds=None,
+                 frozen=False, depends=None):
         self._creation_order = Parameter.__creation_counter__
         Parameter.__creation_counter__ += 1
 
+        self.name = name
         self.default = default
         self.bounds = bounds
         self.size = size
@@ -65,7 +66,6 @@ class Parameter(object):
         if depends is not None:
             if not isinstance(depends, Iterable):
                 depends = [depends]
-            [p.add_dependent(self) for p in depends]
         self.depends = depends
 
         # Caching.
@@ -95,7 +95,8 @@ class Parameter(object):
 
     def __repr__(self):
         args = ", ".join(map("{0}={{0.{0}}}".format,
-                             ("default", "bounds", "size")))
+                             ("name", "default", "bounds", "size", "frozen",
+                              "depends")))
         return "Parameter({0})".format(args.format(self))
 
     def get_default(self):
@@ -123,7 +124,6 @@ class Parameter(object):
         self._setter = func
 
     def reset(self):
-        print("reset {0}".format(self.default))
         self.value = None
         [p.reset() for p in self.dependents]
 
@@ -132,9 +132,7 @@ class Parameter(object):
         return hasattr(self, "_getter")
 
     def get_value(self, model):
-        print("face")
         if self.depends is None or self.value is None:
-            print("face2")
             self.value = self._getter(model)
         return self.value
 
@@ -143,8 +141,6 @@ class Parameter(object):
         return hasattr(self, "_setter")
 
     def set_value(self, model, value):
-        print(self.dependents)
-        [p.reset() for p in self.dependents]
         self.value = value
         self._setter(model, value)
 
@@ -169,13 +165,16 @@ class ModelMeta(type):
         # These will form the basis of the modeling protocol by exposing the
         # parameter names and other available settings.
         parameters = []
-        reparams = []
         for name, obj in iteritems(dct):
             if isinstance(obj, Parameter):
-                if obj.has_getter:
-                    reparams.append((name, copy.deepcopy(obj)))
-                else:
-                    parameters.append((name, copy.deepcopy(obj)))
+                obj.name = name
+                if not obj.has_getter:
+                    parameters.append((name, obj))
+
+        # This copy must be after going through the full dict so that we can
+        # reconstruct the dependency tree. There must be a better way but
+        # this works!
+        parameters = [(name, copy.deepcopy(obj)) for name, obj in parameters]
 
         # The parameters are ordered by their creation order (i.e. the order
         # that they appear in the class definition) so that the `vector` will
@@ -183,16 +182,35 @@ class ModelMeta(type):
         dct["__parameters__"] = parameters = OrderedDict(
             sorted(parameters, key=lambda o: o[1]._creation_order)
         )
-        dct["__reparams__"] = reparams = OrderedDict(
-            sorted(reparams, key=lambda o: o[1]._creation_order)
-        )
 
         # Remove the parameter definitions from the namespace so they can be
         # overwritten.
         for k in parameters:
             dct.pop(k)
+
+        # Now we'll do the same and loop through the reparameterizations. For
+        # each reparameterization, update the parent parameters with a link
+        # to the correct (copied) parameter.
+        reparams = []
+        for name, obj in iteritems(dct):
+            if isinstance(obj, Parameter):
+                reparams.append((name, obj))
+        reparams = [(name, copy.deepcopy(obj)) for name, obj in reparams]
+        dct["__reparams__"] = reparams = OrderedDict(
+            sorted(reparams, key=lambda o: o[1]._creation_order)
+        )
         for k in reparams:
             dct.pop(k)
+
+        # Build the dependency tree linking the parents to their children to
+        # keep track of everything.
+        for name, obj in iteritems(reparams):
+            if obj.depends is None:
+                continue
+            for o in obj.depends:
+                parent = parameters.get(o.name)
+                parent = reparams[o.name] if parent is None else parent
+                parent.add_dependent(obj)
 
         return super(ModelMeta, cls).__new__(cls, name, parents, dct)
 
@@ -369,7 +387,8 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
     def match_parameter(self, name):
         # Return fast for exact matches.
         if name in self.__parameters__:
-            return self.__parameters__[name].index
+            p = self.__parameters__[name]
+            return p.index, [p]
 
         # Search the parameter name list for matches.
         inds = []
@@ -381,10 +400,10 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
             inds.append(i)
         if not len(inds):
             raise KeyError("unknown parameter '{0}'".format(name))
-        return inds
+        return inds, [self.__parameters__[i] for i in inds]
 
     def get_parameter(self, name):
-        i = self.match_parameter(name)
+        i, _ = self.match_parameter(name)
         v = self._vector[i]
         try:
             return float(v)
@@ -392,15 +411,16 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
             return v
 
     def set_parameter(self, name, value):
-        i = self.match_parameter(name)
+        i, params = self.match_parameter(name)
         self._vector[i] = value
+        [p.reset() for p in params]
 
     def freeze_parameter(self, name):
-        i = self.match_parameter(name)
+        i, _ = self.match_parameter(name)
         self._frozen[i] = True
 
     def thaw_parameter(self, name):
-        i = self.match_parameter(name)
+        i, _ = self.match_parameter(name)
         self._frozen[i] = False
 
     def get_value(self, *args, **kwargs):
@@ -480,12 +500,14 @@ if __name__ == "__main__":
     print(m.log_sigma)
     print(m.sigma)
     print(m.inv_sigma)
-    # print(m.inv_sigma)
+    print(m.get_value(0.1))
 
     m.sigma = 10.0
     print(m.log_sigma)
     print(m.sigma)
     print(m.inv_sigma)
+    print(m.get_value(0.1))
+
     # print(np.exp(-m.log_sigma))
     # print(m.get_parameter_names())
 
@@ -499,7 +521,6 @@ if __name__ == "__main__":
     # print(m2._vector)
     # print(m2.log_sigma)
 
-    print(m.get_value(0.1))
     # print(m2.get_value(0.1))
 
-    print(m.get_gradient(0.1))
+    # print(m.get_gradient(0.1))
