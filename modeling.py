@@ -145,6 +145,21 @@ class Parameter(object):
         self._setter(model, value)
 
 
+class Relationship(object):
+
+    # As with parameters, we need to keep track of the order that
+    # relationships are created.
+    __creation_counter__ = 0
+
+    def __init__(self, model, backref=None, scalar=True):
+        self._creation_order = Relationship.__creation_counter__
+        Relationship.__creation_counter__ += 1
+
+        self.model = model
+        self.backref = backref
+        self.scalar = scalar
+
+
 class ModelMeta(type):
     """
     This metaclass is used to unpack and parse the parameter specification of

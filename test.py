@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
-__all__ = ["test_gradient"]
+__all__ = [
+    "test_gradient", "test_value_and_gradient",
+]
 
 import numpy as np
 
@@ -52,7 +54,12 @@ def test_gradient(seed=12345):
     assert model.test_gradient(x)
     assert model.grad_count == 3
 
+
+def test_value_and_gradient(seed=12345):
+    np.random.seed(seed)
+    x = np.random.randn(5)
     model = LinearModel2(m=0.5, b=10.0)
+
     assert np.allclose(model.get_value(x), model.get_value_and_gradient(x)[0])
     assert model.value_count == 1
     assert model.test_gradient(x)
