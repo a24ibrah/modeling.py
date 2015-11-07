@@ -4,7 +4,7 @@ A flexible framework for building models for all your data analysis needs.
 
 """
 
-__all__ = ["Parameter", "ModelMixin"]
+__all__ = ["Parameter", "ModelMixin", "parameter_sort"]
 __version__ = "0.0.1.dev0"
 __author__ = "Daniel Foreman-Mackey (foreman.mackey@gmail.com)"
 __copyright__ = "Copyright 2015 Daniel Foreman-Mackey"
@@ -287,6 +287,21 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         if self.__parameters__ is None:
             raise AttributeError(name)
 
+        # This is a hack to make sure that a user implemented gradient will
+        # be preferred to the default numerical gradients. The reason why
+        # this is needed is that I want to allow the user to implement
+        # 'get_gradient_and_value' and/or 'get_gradient'.
+        if name == "get_gradient":
+            if hasattr(self, "get_value_and_gradient"):
+                def f(*args, **kwargs):
+                    return self.get_value_and_gradient(*args, **kwargs)[1]
+            else:
+                f = self._get_gradient
+            return f
+        if name == "get_value_and_gradient":
+            return self._get_value_and_gradient
+
+        # Return the correct parameter or reparameterization.
         o = self.__parameters__.get(name, None)
         if o is None:
             if name not in self.__reparams__:
@@ -331,15 +346,31 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         vector0 = np.array(self._vector)
         self.set_vector(vector)
         value = self.get_value(*args, **kwargs)
-        self._vector = vector0
+        self.set_vector(vector0)
         return value
 
     def get_vector(self, full=False):
+        """
+        Get the current parameter vector.
+
+        :param full: (optional)
+            If ``True``, return the "full" vector, not just the currently
+            thawed parameters. (default: ``False``)
+
+        """
         if full:
             return self._vector
         return self._vector[~self._frozen]
 
     def set_vector(self, value, full=False):
+        """
+        Set the current parameter vector.
+
+        :param full: (optional)
+            If ``True``, the "full" vector will be updated, not just the
+            currently thawed parameters. (default: ``False``)
+
+        """
         [p.reset() for p in self.__reparams__.values()]
         if full:
             self._vector[:] = value
@@ -354,22 +385,66 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
     def vector(self, value):
         self.set_vector(value)
 
+    def get_bounds(self, full=False):
+        """
+        Get the bounds of the parameter space. This will be a list of tuples
+        in a format compatible with ``scipy.optimize.minimize``.
+
+        :param full: (optional)
+            If ``True``, the "full" vector will be checked, not just the
+            currently thawed parameters. (default: ``False``)
+
+        """
+        if full:
+            return self._bounds
+        return [b for i, b in enumerate(self._bounds) if not self._frozen[i]]
+
     def check_vector(self, vector, full=False):
-        bounds = self.get_bounds()
+        """
+        Returns ``True`` if a proposed vector is within the allowed bounds of
+        parameter space. If a ``validate`` method is implemented, it will
+        also be tested. Note: if you implement a validate method, the
+        parameters will have to be updated (i.e. you'll lose any cached
+        values) but then reset to the current value.
+
+        :param vector:
+            The proposed parameter vector.
+
+        :param full: (optional)
+            If ``True``, the "full" vector will be checked, not just the
+            currently thawed parameters. (default: ``False``)
+
+        """
+        # Check the bounds first.
+        bounds = self.get_bounds(full=full)
         if len(bounds) != len(vector):
             raise ValueError("dimension mismatch")
         for i, (a, b) in enumerate(bounds):
             v = vector[i]
             if (a is not None and v < a) or (b is not None and b < v):
                 return False
-        return True
 
-    def get_bounds(self, full=False):
-        if full:
-            return self._bounds
-        return [b for i, b in enumerate(self._bounds) if not self._frozen[i]]
+        # If implemented, call the 'validate' method and check the output.
+        flag = True
+        if hasattr(self, "validate"):
+            vector0 = np.array(self.get_vector(full=full))
+            self.set_vector(vector, full=full)
+            flag = self.validate()
+            self.set_vector(vector0, full=full)
+
+        return flag
 
     def get_parameter_names(self, full=False):
+        """
+        Get the list of parameter names. This only includes base parameters
+        (not reparameterizations) and it will be in the same order as the
+        parameter vector.
+
+        :param full: (optional)
+            If ``True``, get all the parameter names, not just the
+            currently thawed parameters. (default: ``False``)
+
+        """
         names = []
         for k, o in iteritems(self.__parameters__):
             if len(o):
@@ -427,10 +502,13 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         raise NotImplementedError("sublasses must implement the 'get_value' "
                                   "method")
 
-    def get_gradient(self, *args, **kwargs):
-        if hasattr(self, "get_value_and_gradient"):
-            return self.get_value_and_gradient(*args, **kwargs)[1]
+    def _get_value_and_gradient(self, *args, **kwargs):
+        return (
+            self.get_value(*args, **kwargs),
+            self.get_gradient(*args, **kwargs)
+        )
 
+    def _get_gradient(self, *args, **kwargs):
         logging.warn("using default numerical gradients; this might be slow "
                      "and numerically unstable")
         return self.get_numerical_gradient(*args, **kwargs)
@@ -449,27 +527,86 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
             grad[i] = (value - value0) / eps
         return grad
 
-    @staticmethod
-    def parameter_sort(f):
-        if f.__name__ == "get_value_and_gradient":
-            def func(self, *args, **kwargs):
-                value, gradient = f(self, *args, **kwargs)
-                return value, self._sort(gradient)
-        elif f.__name__ == "get_gradient":
-            def func(self, *args, **kwargs):
-                return self._sort(f(self, *args, **kwargs))
-        return func
+    def test_gradient(self, *args, **kwargs):
+        return (np.allclose(
+            self.get_gradient(*args, **kwargs),
+            self.get_numerical_gradient(*args, **kwargs),
+        ) and np.allclose(
+            self.get_value_and_gradient(*args, **kwargs)[1],
+            self.get_numerical_gradient(*args, **kwargs),
+        ))
 
     def _sort(self, values):
-        ret = [values[k] for k in self.get_parameter_names()]
-        # Horrible hack to only return numpy array if that's what was
-        # given by the wrapped function.
-        if len(ret) and type(ret[0]).__module__ == np.__name__:
-            return np.vstack(ret)
-        return ret
+        return np.array([values[k] for k in self.get_parameter_names()])
 
 
-class Model(ModelMixin):
+def parameter_sort(f):
+    """
+    A decorator used to sort a dictionary of outputs from a model method into
+    the correct parameter order. This will generally but useful for sorting
+    the output from a method computing model gradients.
+
+    Here's an example for how you might use it:
+
+    .. code-block:: python
+
+        class LinearModel(ModelMixin):
+
+            m = Parameter()
+            b = Parameter()
+
+            def get_value(self, x):
+                return self.m * x + self.b
+
+            @parameter_sort
+            def get_gradient(self, x):
+                return dict(m=x, b=np.ones_like(x))
+
+    """
+
+    def func(self, *args, **kwargs):
+        # Call the method.
+        values = f(self, *args, **kwargs)
+
+        # Try to sort the output. This will work if the method just outputs
+        # a single dictionary.
+        try:
+            return self._sort(values)
+        except KeyError:
+            raise ValueError("a method wrapped by 'parameter_sort' must "
+                             "return a dictionary with a key for each "
+                             "parameter in: {0}"
+                             .format(self.get_parameter_names()))
+        except TypeError:
+            pass
+
+        # If we get here, the output is more complicated. If it is iterable,
+        # we'll check each element to see if it has the right format of
+        # dictionary.
+        if not isinstance(values, Iterable):
+            raise ValueError("invalid output for a method wrapped by "
+                             "'parameter_sort'")
+        any_ = False
+        ret = []
+        for v in values:
+            # For each element in the output, try to sort it.
+            try:
+                ret.append(self._sort(v))
+            except (KeyError, TypeError, IndexError):
+                ret.append(v)
+            else:
+                any_ = True
+        if not any_:
+            raise ValueError("a method wrapped by 'parameter_sort' must "
+                             "return at least one dictionary with a key for "
+                             "each parameter in: {0}"
+                             .format(self.get_parameter_names()))
+
+        return tuple(ret)
+    return func
+
+
+class Model1(ModelMixin):
 
     amp = Parameter(frozen=True, default=0.1, bounds=(-10, 10))
     mu = Parameter(size=3)
@@ -494,9 +631,14 @@ class Model(ModelMixin):
     def get_inv_sigma(self):
         return 1.0 / self.sigma
 
+    @parameter_sort
+    def get_value_and_gradient(self, x):
+        value = self.get_value(x)
+        return value, dict(amp=0.0, mu=1.0, log_sigma=0.0)
+
 
 if __name__ == "__main__":
-    m = Model(sigma=1.0, mu=0.0)
+    m = Model1(sigma=1.0, mu=0.0)
     print(m.log_sigma)
     print(m.sigma)
     print(m.inv_sigma)
@@ -515,7 +657,7 @@ if __name__ == "__main__":
     # print(m.get_bounds())
     # print(m.get_vector())
     # print(m.get_parameter_names(full=True))
-    # m.thaw_parameter("amp")
+    m.thaw_parameter("amp")
 
     # m2 = Model(log_sigma=10.0, mu=.5)
     # print(m2._vector)
@@ -523,4 +665,4 @@ if __name__ == "__main__":
 
     # print(m2.get_value(0.1))
 
-    # print(m.get_gradient(0.1))
+    print(m.get_gradient(0.1))
