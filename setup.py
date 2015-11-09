@@ -23,7 +23,7 @@ setup(
     package_data={"": ["LICENSE", "README.rst"]},
     include_package_data=True,
     classifiers=[
-        "Development Status :: 1 - Production/Stable",
+        "Development Status :: 4 - Beta",
         "License :: OSI Approved :: MIT License",
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research",
