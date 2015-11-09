@@ -6,7 +6,7 @@ A flexible framework for building models for all your data analysis needs.
 
 __all__ = ["Parameter", "ModelMixin", "parameter_sort"]
 __version__ = "0.0.1.dev0"
-__author__ = "Daniel Foreman-Mackey (foreman.mackey@gmail.com)"
+__author__ = "Daniel Foreman-Mackey"
 __copyright__ = "Copyright 2015 Daniel Foreman-Mackey"
 __contributors__ = [
     # Alphabetical by first name.
@@ -22,7 +22,7 @@ import numpy as np
 from six import with_metaclass, iteritems
 
 
-_prefix_re = re.compile("(.+?)(?:\((.*?)\)):(.*)")
+_prefix_re = re.compile("(.+?)(?:\((.*?)\))?:(.*)")
 
 
 class Parameter(object):
@@ -583,7 +583,6 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         # Search the parameter name list for matches.
         inds = []
         names = []
-        params = []
         relationships = []
         for i, n in enumerate(self.get_parameter_names(full=True)):
             if not fnmatch.fnmatch(n, name):
@@ -594,7 +593,6 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
 
             prefix = _prefix_re.findall(n)
             if not len(prefix):
-                params.append(self.__parameters__[n])
                 continue
 
             nm, ind, param = prefix[0]
@@ -607,25 +605,32 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
 
         if not len(inds):
             raise KeyError("unknown parameter '{0}'".format(name))
-        return inds, names, params, relationships
+        return inds, names, relationships
 
     def get_parameter(self, name):
-        inds, names, _, _ = self.match_parameter(name)
+        inds, names, _ = self.match_parameter(name)
         v = self.get_vector(full=True)[inds]
         return dict(zip(names, v))
 
     def freeze_parameter(self, name):
-        n = len(self)
-        inds, names, _, relationships = self.match_parameter(name)
-        print(self, inds)
+        # Freeze the local model parameters first.
+        n = len(self._vector)
+        inds, names, relationships = self.match_parameter(name)
         self._frozen[list(i for i in inds if i < n)] = True
+
+        # Then propagate across the relationships.
         for model, attr in relationships:
             model.freeze_parameter(attr)
-            print(model, attr, model.get_parameter_names())
 
     def thaw_parameter(self, name):
-        i, _ = self.match_parameter(name)
-        self._frozen[i] = False
+        # Freeze the local model parameters first.
+        n = len(self._vector)
+        inds, names, relationships = self.match_parameter(name)
+        self._frozen[list(i for i in inds if i < n)] = False
+
+        # Then propagate across the relationships.
+        for model, attr in relationships:
+            model.thaw_parameter(attr)
 
     def get_value(self, *args, **kwargs):
         raise NotImplementedError("sublasses must implement the 'get_value' "
