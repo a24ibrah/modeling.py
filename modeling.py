@@ -12,6 +12,7 @@ __contributors__ = [
     # Alphabetical by first name.
 ]
 
+import re
 import copy
 import logging
 import fnmatch
@@ -19,6 +20,9 @@ from collections import OrderedDict, Iterable
 
 import numpy as np
 from six import with_metaclass, iteritems
+
+
+_prefix_re = re.compile("(.+?)(?:\((.*?)\)):(.*)")
 
 
 class Parameter(object):
@@ -151,13 +155,22 @@ class Relationship(object):
     # relationships are created.
     __creation_counter__ = 0
 
-    def __init__(self, model, backref=None, scalar=True):
+    def __init__(self, model, name=None, backref=None, scalar=True):
         self._creation_order = Relationship.__creation_counter__
         Relationship.__creation_counter__ += 1
 
+        self.name = name
         self.model = model
         self.backref = backref
         self.scalar = scalar
+
+    def __len__(self):
+        return len(self.model)
+
+    def __repr__(self):
+        args = ", ".join(map("{0}={{0.{0}}}".format,
+                             ("name", "backref", "scalar")))
+        return "Relationship({0}, {1})".format(self.model, args.format(self))
 
 
 class ModelMeta(type):
@@ -320,7 +333,7 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         # this is needed is that I want to allow the user to implement
         # 'get_gradient_and_value' and/or 'get_gradient'.
         if name == "get_gradient":
-            if hasattr(self, "get_value_and_gradient"):
+            if "get_value_and_gradient" in dir(self):
                 def f(*args, **kwargs):
                     return self.get_value_and_gradient(*args, **kwargs)[1]
             else:
@@ -401,12 +414,22 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
             thawed parameters. (default: ``False``)
 
         """
+        # Get the base vector for this model.
         if full:
             v = self._vector
         else:
             v = self._vector[~self._frozen]
-        return np.concatenate([v] + [o.get_vector(full=full)
-                                     for o in self._relationships.values()])
+
+        # Then append the vectors for all the relationships.
+        v = [v]
+        for k, rel in iteritems(self.__relationships__):
+            o = self._relationships[k]
+            if rel.scalar:
+                v.append(o.get_vector(full=full))
+            else:
+                v += [m.get_vector(full=full) for m in o]
+
+        return np.concatenate(v)
 
     def set_vector(self, value, full=False):
         """
@@ -424,10 +447,19 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         else:
             n = len(self)
             self._vector[~self._frozen] = value[:n]
-        for o in self._relationships.values():
-            d = len(o.get_vector(full=full))
-            o.set_vector(value[n:n+d], full=full)
-            n += d
+
+        # Then append the vectors for all the relationships.
+        for k, rel in iteritems(self.__relationships__):
+            o = self._relationships[k]
+            if rel.scalar:
+                d = len(o)
+                o.set_vector(value[n:n+d], full=full)
+                n += d
+            else:
+                for m in o:
+                    d = len(m)
+                    m.set_vector(value[n:n+d], full=full)
+                    n += d
 
     @property
     def vector(self):
@@ -452,8 +484,15 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         else:
             bounds = [b for i, b in enumerate(self._bounds)
                       if not self._frozen[i]]
-        return bounds + [b for o in self._relationships.keys()
-                         for b in o.get_bounds(full=full)]
+
+        for k, rel in iteritems(self.__relationships__):
+            o = self._relationships[k]
+            if rel.scalar:
+                o = [o]
+            for m in o:
+                bounds += m.get_bounds(full=full)
+
+        return bounds
 
     def check_vector(self, vector, full=False):
         """
@@ -488,9 +527,13 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
             flag = self.validate()
             self.set_vector(vector0, full=full)
             if flag:
-                for o in self._relationships.values():
-                    if hasattr(o, "validate"):
-                        flag &= o.validate()
+                for k, rel in iteritems(self.__relationships__):
+                    m = self._relationships[k]
+                    if rel.scalar:
+                        m = [m]
+                    for o in m:
+                        if hasattr(o, "validate"):
+                            flag &= o.validate()
 
         return flag
 
@@ -513,7 +556,6 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
                 names.append(k)
         if not full:
             names = [n for i, n in enumerate(names) if not self._frozen[i]]
-        print(names, self._frozen, full)
         for k, o in iteritems(self.__relationships__):
             rel = self._relationships[k]
             if o.scalar:
@@ -530,39 +572,56 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         return self.get_parameter_names()
 
     def match_parameter(self, name):
-        # Return fast for exact matches.
-        if name in self.__parameters__:
-            p = self.__parameters__[name]
-            return p.index, [p]
+        """
+        Match a parameter name or pattern against the parameters and
+        relationships of this model.
 
+        :returns parameter_names, parameter_list,
+                 relationship_names, relationship:
+
+        """
         # Search the parameter name list for matches.
         inds = []
+        names = []
+        params = []
+        relationships = []
         for i, n in enumerate(self.get_parameter_names(full=True)):
-            if n == name:
-                return i
             if not fnmatch.fnmatch(n, name):
                 continue
+
             inds.append(i)
+            names.append(n)
+
+            prefix = _prefix_re.findall(n)
+            if not len(prefix):
+                params.append(self.__parameters__[n])
+                continue
+
+            nm, ind, param = prefix[0]
+            rel = self.__relationships__[nm]
+            if rel.scalar:
+                relationships.append((self._relationships[nm], param))
+            else:
+                relationships.append((self._relationships[nm][int(ind)],
+                                      param))
+
         if not len(inds):
             raise KeyError("unknown parameter '{0}'".format(name))
-        return inds, [self.__parameters__[i] for i in inds]
+        return inds, names, params, relationships
 
     def get_parameter(self, name):
-        i, _ = self.match_parameter(name)
-        v = self._vector[i]
-        try:
-            return float(v)
-        except TypeError:
-            return v
-
-    def set_parameter(self, name, value):
-        i, params = self.match_parameter(name)
-        self._vector[i] = value
-        [p.reset() for p in params]
+        inds, names, _, _ = self.match_parameter(name)
+        v = self.get_vector(full=True)[inds]
+        return dict(zip(names, v))
 
     def freeze_parameter(self, name):
-        i, _ = self.match_parameter(name)
-        self._frozen[i] = True
+        n = len(self)
+        inds, names, _, relationships = self.match_parameter(name)
+        print(self, inds)
+        self._frozen[list(i for i in inds if i < n)] = True
+        for model, attr in relationships:
+            model.freeze_parameter(attr)
+            print(model, attr, model.get_parameter_names())
 
     def thaw_parameter(self, name):
         i, _ = self.match_parameter(name)
