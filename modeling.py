@@ -648,7 +648,7 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         return self.get_numerical_gradient(*args, **kwargs)
 
     def get_numerical_gradient(self, *args, **kwargs):
-        eps = kwargs.pop("_modeling_eps", 1.245e-5)
+        eps = kwargs.pop("_modeling_eps", 1.245e-8)
         vector = self.get_vector()
         value0 = self.get_value(*args, **kwargs)
         grad = np.empty([len(vector)] + list(value0.shape), dtype=np.float64)
@@ -662,13 +662,15 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         return grad
 
     def test_gradient(self, *args, **kwargs):
-        return (np.allclose(
-            self.get_gradient(*args, **kwargs),
-            self.get_numerical_gradient(*args, **kwargs),
-        ) and np.allclose(
-            self.get_value_and_gradient(*args, **kwargs)[1],
-            self.get_numerical_gradient(*args, **kwargs),
-        ))
+        grad2 = self.get_numerical_gradient(*args, **kwargs)
+        kwargs.pop("_modeling_eps", None)
+        grad1 = self.get_gradient(*args, **kwargs)
+        flag = np.allclose(grad1, grad2) and np.allclose(
+            self.get_value_and_gradient(*args, **kwargs)[1], grad2
+        )
+        if not flag:
+            logging.warn("{0} != {1}".format(grad1, grad2))
+        return flag
 
     def _sort(self, values):
         return np.array([values[k] for k in self.get_parameter_names()])
