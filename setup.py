@@ -16,7 +16,7 @@ setup(
     author=modeling.__author__,
     author_email="foreman.mackey@gmail.com",
     url="https://github.com/dfm/modeling.py",
-    py_modules=["corner"],
+    py_modules=["modeling"],
     description=("A flexible framework for building models for all your data "
                  "analysis needs."),
     long_description=open("README.rst").read(),

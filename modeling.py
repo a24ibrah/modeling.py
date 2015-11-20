@@ -155,22 +155,24 @@ class Relationship(object):
     # relationships are created.
     __creation_counter__ = 0
 
-    def __init__(self, model, name=None, backref=None, scalar=True):
+    def __init__(self, model=None, name=None, scalar=True, strict=None):
         self._creation_order = Relationship.__creation_counter__
         Relationship.__creation_counter__ += 1
 
         self.name = name
         self.model = model
-        self.backref = backref
         self.scalar = scalar
+        if strict is None:
+            strict = model is not None
+        self.strict = strict
 
     def __len__(self):
         return len(self.model)
 
     def __repr__(self):
         args = ", ".join(map("{0}={{0.{0}}}".format,
-                             ("name", "backref", "scalar")))
-        return "Relationship({0}, {1})".format(self.model, args.format(self))
+                             ("model", "name", "scalar", "strict")))
+        return "Relationship({0})".format(args.format(self))
 
 
 class ModelMeta(type):
@@ -361,7 +363,7 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         # First check relationships.
         if name in self.__relationships__:
             rel = self.__relationships__[name]
-            if not isinstance(value, rel.model):
+            if rel.strict and not isinstance(value, rel.model):
                 logging.warn("incompatible type for '{0}'".format(name))
             if not rel.scalar and not isinstance(value, Iterable):
                 value = [value]
@@ -384,7 +386,7 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         [p.reset() for p in o.dependents]
 
     def __getitem__(self, k):
-        return self.get_parameter(k)
+        return self.get_parameter(k, unpack=False)
 
     def __setitem__(self, k, v):
         return self.set_parameter(k, v)
@@ -527,6 +529,7 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
             flag = self.validate()
             self.set_vector(vector0, full=full)
             if flag:
+                # Loop over the relationships and validate each sub-model.
                 for k, rel in iteritems(self.__relationships__):
                     m = self._relationships[k]
                     if rel.scalar:
@@ -576,8 +579,27 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         Match a parameter name or pattern against the parameters and
         relationships of this model.
 
-        :returns parameter_names, parameter_list,
-                 relationship_names, relationship:
+        Parameter names or patterns are matched using the `fnmatch module
+        <https://docs.python.org/3.5/library/fnmatch.html>`_.  This means that
+        you can use wild cards like ``*`` or ``?`` as described in the module
+        documentation. The match will be done against the ``full`` parameter
+        list; even frozen parameters will be be returned.
+
+        :param name:
+            The parameter name or pattern.
+
+        :returns parameter_names:
+            An array of indices into the full ``vector`` giving the locations
+            of the parameters.
+
+        :returns parameter_list:
+            A list of matched parameter names. This has the same length and
+            order as ``inds``.
+
+        :returns relationships:
+            A list of elements of the form ``(relationship, parameter)`` where
+            ``relationship`` is a ``Relationship`` matched by the query and
+            ``parameter`` is the name of the parameter for that sub-model.
 
         """
         # Search the parameter name list for matches.
@@ -607,12 +629,58 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
             raise KeyError("unknown parameter '{0}'".format(name))
         return inds, names, relationships
 
-    def get_parameter(self, name):
+    def get_parameter(self, name, unpack=True):
+        """
+        Get the value of a parameter or set of parameters associated with a
+        given name or pattern as matched by ``match_parameter``.
+
+        :param name:
+            The parameter name or pattern.
+
+        :param unpack: (optional)
+            If ``True``, the result will be a dictionary where the matched
+            parameter names are the keys. Otherwise, the result is an array
+            with the matched parameters in the correct order. (default:
+            ``True``)
+
+        """
         inds, names, _ = self.match_parameter(name)
         v = self.get_vector(full=True)[inds]
-        return dict(zip(names, v))
+        if unpack:
+            return dict(zip(names, v))
+        return v
+
+    def set_parameter(self, name, value):
+        """
+        Set the value of a parameter or set of parameters associated with a
+        given name or pattern as matched by ``match_parameter``.
+
+        :param name:
+            The parameter name or pattern.
+
+        :param value:
+            This can be a ``dict`` with all the matched parameter names as
+            keys or a value that can be assigned to the matched values.
+
+        """
+        inds, names, _ = self.match_parameter(name)
+        v = self.get_vector(full=True)
+        try:
+            for nm, val in iteritems(value):
+                v[inds[names.index(nm)]] = val
+        except AttributeError:
+            v[inds] = value
+        self.set_vector(v, full=True)
 
     def freeze_parameter(self, name):
+        """
+        Freeze the parameter or set of parameters associated with a given name
+        or pattern as matched by ``match_parameter``.
+
+        :param name:
+            The parameter name or pattern.
+
+        """
         # Freeze the local model parameters first.
         n = len(self._vector)
         inds, names, relationships = self.match_parameter(name)
@@ -623,6 +691,14 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
             model.freeze_parameter(attr)
 
     def thaw_parameter(self, name):
+        """
+        Thaw the parameter or set of parameters associated with a given name
+        or pattern as matched by ``match_parameter``.
+
+        :param name:
+            The parameter name or pattern.
+
+        """
         # Freeze the local model parameters first.
         n = len(self._vector)
         inds, names, relationships = self.match_parameter(name)
