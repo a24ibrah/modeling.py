@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 
 __all__ = [
-    "test_gradient", "test_value_and_gradient",
+    "test_gradient", "test_value_and_gradient", "test_repr", "test_pickle",
 ]
 
+import pickle
 import numpy as np
 from collections import Iterable
 
@@ -155,3 +156,28 @@ def test_relationship(seed=12345):
         assert np.allclose(vector, model.get_vector())
 
         assert model.test_gradient(x)
+
+
+def test_repr():
+    model = LinearModel2(m=0.5, b=10.0)
+    assert model.__class__.__name__ == "LinearModel2"
+
+
+def test_pickle(seed=12340):
+    np.random.seed(seed)
+    x = np.random.randn(5)
+    y = 0.5 * x + 1.0
+
+    mean_model = LinearModel2(m=0.5, b=10.0)
+    model = LikelihoodModel1(y, mean_model=mean_model, log_sigma2=-0.5)
+    model.freeze_parameter("mean_model:b")
+    pkl = pickle.dumps(model)
+
+    loaded = pickle.loads(pkl)
+    assert np.allclose(loaded.get_vector(), model.get_vector())
+    assert np.allclose(loaded.get_vector(full=True),
+                       model.get_vector(full=True))
+    assert all(a == b for a, b in zip(loaded.get_parameter_names(),
+                                      model.get_parameter_names()))
+    assert all(a == b for a, b in zip(loaded.get_parameter_names(full=True),
+                                      model.get_parameter_names(full=True)))

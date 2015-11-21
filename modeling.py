@@ -248,8 +248,7 @@ class ModelMeta(type):
                 parent = reparams[o.name] if parent is None else parent
                 parent.add_dependent(obj)
 
-        self = super(ModelMeta, cls).__new__(cls, cls_name, parents, dct)
-        return self
+        return super(ModelMeta, cls).__new__(cls, cls_name, parents, dct)
 
 
 class ModelMixin(with_metaclass(ModelMeta, object)):
