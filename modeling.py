@@ -4,7 +4,7 @@ A flexible framework for building models for all your data analysis needs.
 
 """
 
-__all__ = ["Parameter", "ModelMixin", "parameter_sort"]
+__all__ = ["Parameter", "Relationship", "ModelMixin", "parameter_sort"]
 __version__ = "0.0.1.dev0"
 __author__ = "Daniel Foreman-Mackey"
 __copyright__ = "Copyright 2015 Daniel Foreman-Mackey"
@@ -188,7 +188,7 @@ class ModelMeta(type):
 
     """
 
-    def __new__(cls, name, parents, orig_dct):
+    def __new__(cls, cls_name, parents, orig_dct):
         dct = dict(orig_dct)
 
         # Loop over the members of the class and find all the `Parameter`s.
@@ -248,7 +248,8 @@ class ModelMeta(type):
                 parent = reparams[o.name] if parent is None else parent
                 parent.add_dependent(obj)
 
-        return super(ModelMeta, cls).__new__(cls, name, parents, dct)
+        self = super(ModelMeta, cls).__new__(cls, cls_name, parents, dct)
+        return self
 
 
 class ModelMixin(with_metaclass(ModelMeta, object)):
@@ -280,7 +281,10 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
                 o.index = count
                 count += 1
             vector.append(np.atleast_1d(o.get_default()))
-        self._vector = np.concatenate(vector)
+        if len(vector):
+            self._vector = np.concatenate(vector)
+        else:
+            self._vector = np.empty(0)
 
         # Make space for the relationships.
         self._relationships = OrderedDict(
@@ -323,7 +327,8 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
 
     def __repr__(self):
         args = ", ".join(map("{0}={{0.{0}}}".format,
-                             self.__parameters__.keys()))
+                             list(self.__parameters__.keys())
+                             + list(self.__relationships__.keys())))
         return "{0}({1})".format(self.__class__.__name__, args.format(self))
 
     def __getattr__(self, name):
