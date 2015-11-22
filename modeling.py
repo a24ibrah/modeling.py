@@ -606,13 +606,19 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
             ``parameter`` is the name of the parameter for that sub-model.
 
         """
+        if not isinstance(name, (list, tuple)):
+            name = [name]
+
         # Search the parameter name list for matches.
         inds = []
         names = []
         relationships = []
+        matched = [False for _ in range(len(name))]
         for i, n in enumerate(self.get_parameter_names(full=True)):
-            if not fnmatch.fnmatch(n, name):
+            matches = [fnmatch.fnmatch(n, nm) for nm in name]
+            if not any(matches):
                 continue
+            matched = [m1 or m2 for m1, m2 in zip(matched, matches)]
 
             inds.append(i)
             names.append(n)
@@ -629,8 +635,10 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
                 relationships.append((self._relationships[nm][int(ind)],
                                       param))
 
-        if not len(inds):
-            raise KeyError("unknown parameter '{0}'".format(name))
+        if not all(matched):
+            raise KeyError("unknown parameters: {0}".format(
+                [n for i, n in enumerate(name) if not matched[i]]
+            ))
         return inds, names, relationships
 
     def get_parameter(self, name, unpack=True):
