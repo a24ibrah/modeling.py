@@ -136,9 +136,7 @@ class Parameter(object):
         return hasattr(self, "_getter")
 
     def get_value(self, model):
-        if self.depends is None or self.value is None:
-            self.value = self._getter(model)
-        return self.value
+        return self._getter(model)
 
     @property
     def has_setter(self):
@@ -155,23 +153,20 @@ class Relationship(object):
     # relationships are created.
     __creation_counter__ = 0
 
-    def __init__(self, model=None, name=None, scalar=True, strict=None):
+    def __init__(self, model=None, name=None, scalar=True):
         self._creation_order = Relationship.__creation_counter__
         Relationship.__creation_counter__ += 1
 
         self.name = name
         self.model = model
         self.scalar = scalar
-        if strict is None:
-            strict = model is not None
-        self.strict = strict
 
     def __len__(self):
         return len(self.model)
 
     def __repr__(self):
         args = ", ".join(map("{0}={{0.{0}}}".format,
-                             ("model", "name", "scalar", "strict")))
+                             ("model", "name", "scalar")))
         return "Relationship({0})".format(args.format(self))
 
 
@@ -273,6 +268,7 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         count = 0
         vector = []
         for k, o in iteritems(self.__parameters__):
+            o.reset()
             if len(o):
                 o.index = slice(count, count + len(o))
                 count += len(o)
@@ -367,8 +363,6 @@ class ModelMixin(with_metaclass(ModelMeta, object)):
         # First check relationships.
         if name in self.__relationships__:
             rel = self.__relationships__[name]
-            if rel.strict and not isinstance(value, rel.model):
-                logging.warn("incompatible type for '{0}'".format(name))
             if not rel.scalar and not isinstance(value, Iterable):
                 value = [value]
             self._relationships[name] = value

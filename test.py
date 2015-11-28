@@ -181,3 +181,18 @@ def test_pickle(seed=12340):
                                       model.get_parameter_names()))
     assert all(a == b for a, b in zip(loaded.get_parameter_names(full=True),
                                       model.get_parameter_names(full=True)))
+
+
+def test_depends(seed=12345):
+    np.random.seed(seed)
+    x = np.random.randn(5)
+    y = 0.5 * x + 1.0
+
+    model1 = LikelihoodModel1(y, mean_model=LinearModel1(m=0.5, b=10.0),
+                              log_sigma2=0.2)
+    model2 = LikelihoodModel1(y, mean_model=LinearModel1(m=0.5, b=10.0),
+                              log_sigma2=0.1)
+
+    assert not np.allclose(model1.sigma2, model2.sigma2)
+    assert np.allclose(model1.sigma2, np.exp(model1.log_sigma2))
+    assert np.allclose(model2.sigma2, np.exp(model2.log_sigma2))
