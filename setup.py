@@ -2,12 +2,19 @@
 
 import os
 import sys
-import modeling
+
 from setuptools import setup
 
 if sys.argv[-1] == "publish":
     os.system("python setup.py sdist upload")
     sys.exit()
+
+if sys.version_info[0] < 3:
+    import __builtin__ as builtins
+else:
+    import builtins
+builtins.__MODELING_SETUP__ = True
+import modeling  # NOQA
 
 
 setup(
@@ -22,6 +29,7 @@ setup(
     long_description=open("README.rst").read(),
     package_data={"": ["LICENSE", "README.rst"]},
     include_package_data=True,
+    install_requires=["numpy"],
     classifiers=[
         "Development Status :: 4 - Beta",
         "License :: OSI Approved :: MIT License",

@@ -1,824 +1,556 @@
 # -*- coding: utf-8 -*-
-"""
-A flexible framework for building models for all your data analysis needs.
 
-"""
+from __future__ import division, print_function
 
-__all__ = ["Parameter", "Relationship", "ModelMixin", "parameter_sort"]
-__version__ = "0.0.1.dev0"
+from collections import OrderedDict
+from functools import wraps
+from itertools import chain
+
+try:
+    __MODELING_SETUP__
+except NameError:
+    __MODELING_SETUP__ = False
+if not __MODELING_SETUP__:
+    import numpy as np
+
+__all__ = ["Model", "ModelSet", "ConstantModel", "CallableModel",
+           "check_gradient"]
+
+__version__ = "0.0.1"
 __author__ = "Daniel Foreman-Mackey"
-__copyright__ = "Copyright 2015 Daniel Foreman-Mackey"
+__copyright__ = "Copyright 2015, 2016, 2017 Daniel Foreman-Mackey"
 __contributors__ = [
     # Alphabetical by first name.
 ]
 
-import re
-import copy
-import logging
-import fnmatch
-from collections import OrderedDict, Iterable
 
-import numpy as np
-from six import with_metaclass, iteritems
-
-
-_prefix_re = re.compile("(.+?)(?:\((.*?)\))?:(.*)")
-
-
-class Parameter(object):
+class Model(object):
     """
-    Instances of this class provide the parameter specification to custom
-    models.
+    An abstract class implementing the skeleton of the modeling protocol
 
-    :param size: (optional)
-        For vector parameters, ``size`` is the length of the vector. For
-        scalar parameters, keep the default value of ``size=0``.
+    Initial parameter values can either be provided as arguments in the same
+    order as ``parameter_names`` or by name as keyword arguments.
 
-    :param default: (optional)
-        The default value that the parameter should take if it isn't
-        specified. This can be a float or an array of size ``size``.
-
-    :param bounds: (optional)
-        A tuple or list of tuples specifying the bounds of the parameter. For
-        a vector parameter, a single tuple can be given and the bounds will
-        be assumed to be equivalent along each axis. Otherwise, the list of
-        bounds must include ``size`` tuples. To indicate no limit in one
-        direction, use ``None``. For example, for a strictly positive
-        parameter, you could use ``bounds=(0, None)``.
-
-    """
-
-    # This global counter keeps track of the order that parameters are added
-    # to models. The point of this is to force a model to always have a
-    # deterministic parameter order. In practice, the ordering is enforced by
-    # the ``ModelMeta`` metaclass.
-    __creation_counter__ = 0
-
-    def __init__(self, name=None, size=0, default=None, bounds=None,
-                 frozen=False, depends=None):
-        self._creation_order = Parameter.__creation_counter__
-        Parameter.__creation_counter__ += 1
-
-        self.name = name
-        self.default = default
-        self.bounds = bounds
-        self.size = size
-        self.frozen = frozen
-
-        # Build the dependency tree.
-        self.dependents = []
-        if depends is not None:
-            if not isinstance(depends, Iterable):
-                depends = [depends]
-        self.depends = depends
-
-        # Caching.
-        self.value = None
-
-        # Check the bounds.
-        if bounds is None:
-            self.bounds = [(None, None) for i in range(max(1, size))]
-        else:
-            shape = np.shape(bounds)
-            if shape == (2, ):
-                self.bounds = [bounds for i in range(max(1, size))]
-            elif shape != (max(1, size), 2):
-                raise ValueError("invalid bounds; must have shape (size, 2) "
-                                 "or (2,) not {0}".format(shape))
-
-        # Check the default vector.
-        if size > 0 and default is not None:
-            try:
-                float(default)
-            except TypeError:
-                if len(default) != size:
-                    raise ValueError("invalid dimensions for default vector")
-
-    def __len__(self):
-        return self.size
-
-    def __repr__(self):
-        args = ", ".join(map("{0}={{0.{0}}}".format,
-                             ("name", "default", "bounds", "size", "frozen",
-                              "depends")))
-        return "Parameter({0})".format(args.format(self))
-
-    def get_default(self):
-        """
-        Get the default value for the parameter. If no default was defined,
-        this will return ``np.nan`` or an array of ``np.nan`` and with
-        correct shape.
-
-        """
-        if len(self):
-            if self.default is None:
-                return np.nan + np.zeros(len(self))
-            return self.default + np.zeros(len(self))
-        if self.default is None:
-            return np.nan
-        return self.default
-
-    def add_dependent(self, param):
-        self.dependents.append(param)
-
-    def getter(self, func):
-        self._getter = func
-
-    def setter(self, func):
-        self._setter = func
-
-    def reset(self):
-        self.value = None
-        [p.reset() for p in self.dependents]
-
-    @property
-    def has_getter(self):
-        return hasattr(self, "_getter")
-
-    def get_value(self, model):
-        return self._getter(model)
-
-    @property
-    def has_setter(self):
-        return hasattr(self, "_setter")
-
-    def set_value(self, model, value):
-        self.value = value
-        self._setter(model, value)
-
-
-class Relationship(object):
-
-    # As with parameters, we need to keep track of the order that
-    # relationships are created.
-    __creation_counter__ = 0
-
-    def __init__(self, model=None, name=None, scalar=True):
-        self._creation_order = Relationship.__creation_counter__
-        Relationship.__creation_counter__ += 1
-
-        self.name = name
-        self.model = model
-        self.scalar = scalar
-
-    def __len__(self):
-        return len(self.model)
-
-    def __repr__(self):
-        args = ", ".join(map("{0}={{0.{0}}}".format,
-                             ("model", "name", "scalar")))
-        return "Relationship({0})".format(args.format(self))
-
-
-class ModelMeta(type):
-    """
-    This metaclass is used to unpack and parse the parameter specification of
-    a new model on creation. The main thing that it does is pop the
-    ``Parameter`` attributes from the object's ``__dict__`` and converts them
-    into an ``OrderedDict`` (ordered by ``Parameter._creation_order``) that
-    is subsequently added to the namespace as ``__parameters__``. This allows
-    the model to have a well-defined parameter order.
-
-    They always say: "if you need metaprogramming, you'll know"...
-
-    """
-
-    def __new__(cls, cls_name, parents, orig_dct):
-        dct = dict(orig_dct)
-
-        # Loop over the members of the class and find all the `Parameter`s.
-        # These will form the basis of the modeling protocol by exposing the
-        # parameter names and other available settings.
-        parameters = []
-        for name, obj in iteritems(dct):
-            if isinstance(obj, Parameter):
-                obj.name = name
-                if not obj.has_getter:
-                    parameters.append((name, obj))
-
-        # This copy must be after going through the full dict so that we can
-        # reconstruct the dependency tree. There must be a better way but
-        # this works!
-        parameters = [(name, copy.deepcopy(obj)) for name, obj in parameters]
-
-        # The parameters are ordered by their creation order (i.e. the order
-        # that they appear in the class definition) so that the `vector` will
-        # be deterministic.
-        dct["__parameters__"] = parameters = OrderedDict(
-            sorted(parameters, key=lambda o: o[1]._creation_order)
-        )
-
-        # Remove the parameter definitions from the namespace so they can be
-        # overwritten.
-        for k in parameters:
-            dct.pop(k)
-
-        # Now we'll do the same and loop through and find the
-        # reparameterizations and relationships.
-        reparams = []
-        relationships = []
-        for name, obj in iteritems(dct):
-            if isinstance(obj, Parameter):
-                reparams.append((name, copy.deepcopy(obj)))
-            elif isinstance(obj, Relationship):
-                relationships.append((name, copy.deepcopy(obj)))
-
-        dct["__reparams__"] = reparams = OrderedDict(
-            sorted(reparams, key=lambda o: o[1]._creation_order)
-        )
-        [dct.pop(k) for k in reparams]
-
-        dct["__relationships__"] = relationships = OrderedDict(
-            sorted(relationships, key=lambda o: o[1]._creation_order)
-        )
-        [dct.pop(k) for k in relationships]
-
-        # Build the dependency tree linking the parents to their children to
-        # keep track of everything.
-        for name, obj in iteritems(reparams):
-            if obj.depends is None:
-                continue
-            for o in obj.depends:
-                parent = parameters.get(o.name)
-                parent = reparams[o.name] if parent is None else parent
-                parent.add_dependent(obj)
-
-        return super(ModelMeta, cls).__new__(cls, cls_name, parents, dct)
-
-
-class ModelMixin(with_metaclass(ModelMeta, object)):
-    """
-    An abstract base class implementing most of the modeling functionality.
-    To implement a custom model, inherit from this import class, list
-    parameters using ``Parameter`` objects and implement the ``get_value``
-    method. When initializing the custom model, the default ``__init__``
-    takes your parameter values as keyword arguments and it will check to
-    make sure that you completely specified the model.
-
-    """
-
-    def __new__(cls, *args, **kwargs):
-        # On creation of a new model, we use this method to make sure that
-        # all the necessary memory is allocated and all the bookkeeping
-        # arrays are in place.
-        self = super(ModelMixin, cls).__new__(cls)
-
-        # Preallocate space for the vector and compute how each parameter
-        # will index into the vector.
-        count = 0
-        vector = []
-        for k, o in iteritems(self.__parameters__):
-            o.reset()
-            if len(o):
-                o.index = slice(count, count + len(o))
-                count += len(o)
-            else:
-                o.index = count
-                count += 1
-            vector.append(np.atleast_1d(o.get_default()))
-        if len(vector):
-            self._vector = np.concatenate(vector)
-        else:
-            self._vector = np.empty(0)
-
-        # Make space for the relationships.
-        self._relationships = OrderedDict(
-            (k, None) if o.scalar else (k, [])
-            for k, o in iteritems(self.__relationships__)
-        )
-
-        # Keep track of which parameters are frozen or thawed and save the
-        # parameter bounds.
-        self._frozen = np.zeros(count, dtype=bool)
-        self._bounds = []
-        for k, o in iteritems(self.__parameters__):
-            self._frozen[o.index] = o.frozen
-            self._bounds += o.bounds
-
-        return self
-
-    def __init__(self, **kwargs):
-        for k, v in iteritems(kwargs):
-            if (k not in self.__parameters__ and k not in self.__reparams__
-                    and k not in self.__relationships__):
-                raise ValueError("unrecognized parameter '{0}'".format(k))
-            setattr(self, k, v)
-
-        # Check to make sure that all the parameters were given either with
-        # a default value or in this initialization.
-        if np.any(np.isnan(self._vector)):
-            pars = []
-            for k, o in iteritems(self.__parameters__):
-                if np.any(np.isnan(self._vector[o.index])):
-                    pars.append(k)
-            raise ValueError(
-                ("missing values for parameters: {0}. Use a default parameter "
-                 "value or specify a value in the initialization of the model")
-                .format(pars)
-            )
-
-    def __len__(self):
-        return len(self._frozen) - sum(self._frozen)
-
-    def __repr__(self):
-        args = ", ".join(map("{0}={{0.{0}}}".format,
-                             list(self.__parameters__.keys())
-                             + list(self.__relationships__.keys())))
-        return "{0}({1})".format(self.__class__.__name__, args.format(self))
-
-    def __getattr__(self, name):
-        if self.__parameters__ is None:
-            raise AttributeError(name)
-
-        # This is a hack to make sure that a user implemented gradient will
-        # be preferred to the default numerical gradients. The reason why
-        # this is needed is that I want to allow the user to implement
-        # 'get_gradient_and_value' and/or 'get_gradient'.
-        if name == "get_gradient":
-            if "get_value_and_gradient" in dir(self):
-                def f(*args, **kwargs):
-                    return self.get_value_and_gradient(*args, **kwargs)[1]
-            else:
-                f = self._get_gradient
-            return f
-        if name == "get_value_and_gradient":
-            return self._get_value_and_gradient
-
-        # First check relationships.
-        if name in self.__relationships__:
-            return self._relationships[name]
-
-        # Return the correct parameter or reparameterization.
-        o = self.__parameters__.get(name, None)
-        if o is None:
-            if name not in self.__reparams__:
-                raise AttributeError(name)
-            return self.__reparams__[name].get_value(self)
-        return self._vector[o.index]
-
-    def __setattr__(self, name, value):
-        if self.__parameters__ is None:
-            return super(ModelMixin, self).__setattr__(name, value)
-
-        # First check relationships.
-        if name in self.__relationships__:
-            rel = self.__relationships__[name]
-            if not rel.scalar and not isinstance(value, Iterable):
-                value = [value]
-            self._relationships[name] = value
-            return
-
-        # Then parameters/reparameterizations.
-        o = self.__parameters__.get(name, None)
-        if o is None:
-            o = self.__reparams__.get(name, None)
-            if o is None:
-                return super(ModelMixin, self).__setattr__(name, value)
-            if not o.has_setter:
-                raise AttributeError("'{0}' is read-only".format(name))
-            o.set_value(self, value)
-        else:
-            self._vector[o.index] = value
-
-        # Make sure that any dependent parameters get reset.
-        [p.reset() for p in o.dependents]
-
-    def __getitem__(self, k):
-        return self.get_parameter(k, unpack=False)
-
-    def __setitem__(self, k, v):
-        return self.set_parameter(k, v)
-
-    def __call__(self, vector, *args, **kwargs):
-        """
-        Evaluate the model at a given parameter vector. Any other arguments
-        are passed directly to ``get_value``.
-
-        :param vector:
-            The vector of parameters where you would like to evaluate the
-            model.
-
-        """
-        vector0 = np.array(self.get_vector())
-        self.set_vector(vector)
-        value = self.get_value(*args, **kwargs)
-        self.set_vector(vector0)
-        return value
-
-    def get_vector(self, full=False):
-        """
-        Get the current parameter vector.
-
-        :param full: (optional)
-            If ``True``, return the "full" vector, not just the currently
-            thawed parameters. (default: ``False``)
-
-        """
-        # Get the base vector for this model.
-        if full:
-            v = self._vector
-        else:
-            v = self._vector[~self._frozen]
-
-        # Then append the vectors for all the relationships.
-        v = [v]
-        for k, rel in iteritems(self.__relationships__):
-            o = self._relationships[k]
-            if rel.scalar:
-                v.append(o.get_vector(full=full))
-            else:
-                v += [m.get_vector(full=full) for m in o]
-
-        return np.concatenate(v)
-
-    def set_vector(self, value, full=False):
-        """
-        Set the current parameter vector.
-
-        :param full: (optional)
-            If ``True``, the "full" vector will be updated, not just the
-            currently thawed parameters. (default: ``False``)
-
-        """
-        [p.reset() for p in self.__reparams__.values()]
-        if full:
-            n = len(self._vector)
-            self._vector[:] = value[:n]
-        else:
-            n = len(self)
-            self._vector[~self._frozen] = value[:n]
-
-        # Then append the vectors for all the relationships.
-        for k, rel in iteritems(self.__relationships__):
-            o = self._relationships[k]
-            if rel.scalar:
-                d = len(o)
-                o.set_vector(value[n:n+d], full=full)
-                n += d
-            else:
-                for m in o:
-                    d = len(m)
-                    m.set_vector(value[n:n+d], full=full)
-                    n += d
-
-    @property
-    def vector(self):
-        return self.get_vector()
-
-    @vector.setter
-    def vector(self, value):
-        self.set_vector(value)
-
-    def get_bounds(self, full=False):
-        """
-        Get the bounds of the parameter space. This will be a list of tuples
-        in a format compatible with ``scipy.optimize.minimize``.
-
-        :param full: (optional)
-            If ``True``, the "full" vector will be checked, not just the
-            currently thawed parameters. (default: ``False``)
-
-        """
-        if full:
-            bounds = self._bounds
-        else:
-            bounds = [b for i, b in enumerate(self._bounds)
-                      if not self._frozen[i]]
-
-        for k, rel in iteritems(self.__relationships__):
-            o = self._relationships[k]
-            if rel.scalar:
-                o = [o]
-            for m in o:
-                bounds += m.get_bounds(full=full)
-
-        return bounds
-
-    def check_vector(self, vector, full=False):
-        """
-        Returns ``True`` if a proposed vector is within the allowed bounds of
-        parameter space. If a ``validate`` method is implemented, it will
-        also be tested. Note: if you implement a validate method, the
-        parameters will have to be updated (i.e. you'll lose any cached
-        values) but then reset to the current value.
-
-        :param vector:
-            The proposed parameter vector.
-
-        :param full: (optional)
-            If ``True``, the "full" vector will be checked, not just the
-            currently thawed parameters. (default: ``False``)
-
-        """
-        # Check the bounds first.
-        bounds = self.get_bounds(full=full)
-        if len(bounds) != len(vector):
-            raise ValueError("dimension mismatch")
-        for i, (a, b) in enumerate(bounds):
-            v = vector[i]
-            if (a is not None and v < a) or (b is not None and b < v):
-                return False
-
-        # If implemented, call the 'validate' method and check the output.
-        flag = True
-        if hasattr(self, "validate"):
-            vector0 = np.array(self.get_vector(full=full))
-            self.set_vector(vector, full=full)
-            flag = self.validate()
-            self.set_vector(vector0, full=full)
-            if flag:
-                # Loop over the relationships and validate each sub-model.
-                for k, rel in iteritems(self.__relationships__):
-                    m = self._relationships[k]
-                    if rel.scalar:
-                        m = [m]
-                    for o in m:
-                        if hasattr(o, "validate"):
-                            flag &= o.validate()
-
-        return flag
-
-    def get_parameter_names(self, full=False):
-        """
-        Get the list of parameter names. This only includes base parameters
-        (not reparameterizations) and it will be in the same order as the
-        parameter vector.
-
-        :param full: (optional)
-            If ``True``, get all the parameter names, not just the
-            currently thawed parameters. (default: ``False``)
-
-        """
-        names = []
-        for k, o in iteritems(self.__parameters__):
-            if len(o):
-                names += ["{0}({1})".format(k, i) for i in range(len(o))]
-            else:
-                names.append(k)
-        if not full:
-            names = [n for i, n in enumerate(names) if not self._frozen[i]]
-        for k, o in iteritems(self.__relationships__):
-            rel = self._relationships[k]
-            if o.scalar:
-                names += ["{0}:{1}".format(k, n)
-                          for n in rel.get_parameter_names(full=full)]
-            else:
-                names += ["{0}({2}):{1}".format(k, n, i)
-                          for i, r in enumerate(rel)
-                          for n in r.get_parameter_names(full=full)]
-        return names
-
-    @property
-    def parameter_names(self):
-        return self.get_parameter_names()
-
-    def match_parameter(self, name):
-        """
-        Match a parameter name or pattern against the parameters and
-        relationships of this model.
-
-        Parameter names or patterns are matched using the `fnmatch module
-        <https://docs.python.org/3.5/library/fnmatch.html>`_.  This means that
-        you can use wild cards like ``*`` or ``?`` as described in the module
-        documentation. The match will be done against the ``full`` parameter
-        list; even frozen parameters will be be returned.
-
-        :param name:
-            The parameter name or pattern.
-
-        :returns parameter_names:
-            An array of indices into the full ``vector`` giving the locations
-            of the parameters.
-
-        :returns parameter_list:
-            A list of matched parameter names. This has the same length and
-            order as ``inds``.
-
-        :returns relationships:
-            A list of elements of the form ``(relationship, parameter)`` where
-            ``relationship`` is a ``Relationship`` matched by the query and
-            ``parameter`` is the name of the parameter for that sub-model.
-
-        """
-        if not isinstance(name, (list, tuple)):
-            name = [name]
-
-        # Search the parameter name list for matches.
-        inds = []
-        names = []
-        relationships = []
-        matched = [False for _ in range(len(name))]
-        for i, n in enumerate(self.get_parameter_names(full=True)):
-            matches = [fnmatch.fnmatch(n, nm) for nm in name]
-            if not any(matches):
-                continue
-            matched = [m1 or m2 for m1, m2 in zip(matched, matches)]
-
-            inds.append(i)
-            names.append(n)
-
-            prefix = _prefix_re.findall(n)
-            if not len(prefix):
-                continue
-
-            nm, ind, param = prefix[0]
-            rel = self.__relationships__[nm]
-            if rel.scalar:
-                relationships.append((self._relationships[nm], param))
-            else:
-                relationships.append((self._relationships[nm][int(ind)],
-                                      param))
-
-        if not all(matched):
-            raise KeyError("unknown parameters: {0}".format(
-                [n for i, n in enumerate(name) if not matched[i]]
-            ))
-        return inds, names, relationships
-
-    def get_parameter(self, name, unpack=True):
-        """
-        Get the value of a parameter or set of parameters associated with a
-        given name or pattern as matched by ``match_parameter``.
-
-        :param name:
-            The parameter name or pattern.
-
-        :param unpack: (optional)
-            If ``True``, the result will be a dictionary where the matched
-            parameter names are the keys. Otherwise, the result is an array
-            with the matched parameters in the correct order. (default:
-            ``True``)
-
-        """
-        inds, names, _ = self.match_parameter(name)
-        v = self.get_vector(full=True)[inds]
-        if unpack:
-            return dict(zip(names, v))
-        return v
-
-    def set_parameter(self, name, value):
-        """
-        Set the value of a parameter or set of parameters associated with a
-        given name or pattern as matched by ``match_parameter``.
-
-        :param name:
-            The parameter name or pattern.
-
-        :param value:
-            This can be a ``dict`` with all the matched parameter names as
-            keys or a value that can be assigned to the matched values.
-
-        """
-        inds, names, _ = self.match_parameter(name)
-        v = self.get_vector(full=True)
-        try:
-            for nm, val in iteritems(value):
-                v[inds[names.index(nm)]] = val
-        except AttributeError:
-            v[inds] = value
-        self.set_vector(v, full=True)
-
-    def freeze_parameter(self, name):
-        """
-        Freeze the parameter or set of parameters associated with a given name
-        or pattern as matched by ``match_parameter``.
-
-        :param name:
-            The parameter name or pattern.
-
-        """
-        # Freeze the local model parameters first.
-        n = len(self._vector)
-        inds, names, relationships = self.match_parameter(name)
-        self._frozen[list(i for i in inds if i < n)] = True
-
-        # Then propagate across the relationships.
-        for model, attr in relationships:
-            model.freeze_parameter(attr)
-
-    def thaw_parameter(self, name):
-        """
-        Thaw the parameter or set of parameters associated with a given name
-        or pattern as matched by ``match_parameter``.
-
-        :param name:
-            The parameter name or pattern.
-
-        """
-        # Freeze the local model parameters first.
-        n = len(self._vector)
-        inds, names, relationships = self.match_parameter(name)
-        self._frozen[list(i for i in inds if i < n)] = False
-
-        # Then propagate across the relationships.
-        for model, attr in relationships:
-            model.thaw_parameter(attr)
-
-    def get_value(self, *args, **kwargs):
-        raise NotImplementedError("sublasses must implement the 'get_value' "
-                                  "method")
-
-    def _get_value_and_gradient(self, *args, **kwargs):
-        return (
-            self.get_value(*args, **kwargs),
-            self.get_gradient(*args, **kwargs)
-        )
-
-    def _get_gradient(self, *args, **kwargs):
-        logging.warn("using default numerical gradients; this might be slow "
-                     "and numerically unstable")
-        return self.get_numerical_gradient(*args, **kwargs)
-
-    def get_numerical_gradient(self, *args, **kwargs):
-        eps = kwargs.pop("_modeling_eps", 1.245e-8)
-        vector = self.get_vector()
-        value0 = self.get_value(*args, **kwargs)
-        grad = np.empty([len(vector)] + list(value0.shape), dtype=np.float64)
-        for i, v in enumerate(vector):
-            vector[i] = v + eps
-            self.set_vector(vector)
-            value = self.get_value(*args, **kwargs)
-            vector[i] = v
-            self.set_vector(vector)
-            grad[i] = (value - value0) / eps
-        return grad
-
-    def test_gradient(self, *args, **kwargs):
-        grad2 = self.get_numerical_gradient(*args, **kwargs)
-        kwargs.pop("_modeling_eps", None)
-        grad1 = self.get_gradient(*args, **kwargs)
-        flag = np.allclose(grad1, grad2) and np.allclose(
-            self.get_value_and_gradient(*args, **kwargs)[1], grad2
-        )
-        if not flag:
-            logging.warn("{0} != {1}".format(grad1, grad2))
-        return flag
-
-    def _sort(self, values):
-        return np.array([values[k] for k in self.get_parameter_names()])
-
-
-def parameter_sort(f):
-    """
-    A decorator used to sort a dictionary of outputs from a model method into
-    the correct parameter order. This will generally but useful for sorting
-    the output from a method computing model gradients.
-
-    Here's an example for how you might use it:
+    A minimal subclass of this would have the form:
 
     .. code-block:: python
 
-        class LinearModel(ModelMixin):
-
-            m = Parameter()
-            b = Parameter()
+        class CustomModel(Model):
+            parameter_names = ("parameter_1", "parameter_2")
 
             def get_value(self, x):
-                return self.m * x + self.b
+                return self.parameter_1 + self.parameter_2 + x
 
-            @parameter_sort
-            def get_gradient(self, x):
-                return dict(m=x, b=np.ones_like(x))
+        model = CustomModel(parameter_1=1.0, parameter_2=2.0)
+        # or...
+        model = CustomModel(1.0, 2.0)
+
+    Args:
+        bounds (Optional[list or dict]): Bounds can be given for each
+            parameter setting their minimum and maximum allowed values.
+            This parameter can either be a ``list`` (with length
+            ``full_size``) or a ``dict`` with named parameters. Any parameters
+            that are omitted from the ``dict`` will be assumed to have no
+            bounds. These bounds can be retrieved later using the
+            :func:`modeling.Model.get_parameter_bounds` method and, by
+            default, they are used in the :func:`modeling.Model.log_prior`
+            method.
 
     """
 
-    def func(self, *args, **kwargs):
-        # Call the method.
-        values = f(self, *args, **kwargs)
+    parameter_names = tuple()
 
-        # Try to sort the output. This will work if the method just outputs
-        # a single dictionary.
+    def __init__(self, *args, **kwargs):
+        self.unfrozen_mask = np.ones(self.full_size, dtype=bool)
+        self.dirty = True
+
+        # Deal with bounds
+        self.parameter_bounds = []
+        bounds = kwargs.pop("bounds", dict())
         try:
-            return self._sort(values)
-        except KeyError:
-            raise ValueError("a method wrapped by 'parameter_sort' must "
-                             "return a dictionary with a key for each "
-                             "parameter in: {0}"
-                             .format(self.get_parameter_names()))
-        except TypeError:
-            pass
+            # Try to treat 'bounds' as a dictionary
+            for name in self.parameter_names:
+                self.parameter_bounds.append(bounds.get(name, (None, None)))
+        except AttributeError:
+            # 'bounds' isn't a dictionary - it had better be a list
+            self.parameter_bounds = list(bounds)
+        if len(self.parameter_bounds) != self.full_size:
+            raise ValueError("the number of bounds must equal the number of "
+                             "parameters")
+        if any(len(b) != 2 for b in self.parameter_bounds):
+            raise ValueError("the bounds for each parameter must have the "
+                             "format: '(min, max)'")
 
-        # If we get here, the output is more complicated. If it is iterable,
-        # we'll check each element to see if it has the right format of
-        # dictionary.
-        if not isinstance(values, Iterable):
-            raise ValueError("invalid output for a method wrapped by "
-                             "'parameter_sort'")
-        any_ = False
-        ret = []
-        for v in values:
-            # For each element in the output, try to sort it.
-            try:
-                ret.append(self._sort(v))
-            except (KeyError, TypeError, IndexError):
-                ret.append(v)
+        # Parameter values can be specified as arguments or keywords
+        if len(args):
+            if len(args) != self.full_size:
+                raise ValueError("expected {0} arguments but got {1}"
+                                 .format(self.full_size, len(args)))
+            if len(kwargs):
+                raise ValueError("parameters must be fully specified by "
+                                 "arguments or keyword arguments, not both")
+            self.parameter_vector = args
+
+        else:
+            # Loop over the kwargs and set the parameter values
+            params = []
+            for k in self.parameter_names:
+                v = kwargs.pop(k, None)
+                if v is None:
+                    raise ValueError("missing parameter '{0}'".format(k))
+                params.append(v)
+            self.parameter_vector = params
+
+            if len(kwargs):
+                raise ValueError("unrecognized parameter(s) '{0}'"
+                                 .format(list(kwargs.keys())))
+
+        # Check the initial prior value
+        quiet = kwargs.get("quiet", False)
+        if not quiet and not np.isfinite(self.log_prior()):
+            raise ValueError("non-finite log prior value")
+
+    def get_value(self, *args, **kwargs):
+        """
+        Compute the "value" of the model for the current parameters
+
+        This method should be overloaded by subclasses to implement the actual
+        functionality of the model.
+
+        """
+        raise NotImplementedError("overloaded by subclasses")
+
+    def compute_gradient(self, *args, **kwargs):
+        """
+        Compute the "gradient" of the model for the current parameters
+
+        The default implementation computes the gradients numerically using
+        a first order forward scheme. For better performance, this method
+        should be overloaded by subclasses. The output of this function
+        should be an array where the first dimension is ``full_size``.
+
+        """
+        _EPS = 1.254e-5
+        vector = self.get_parameter_vector()
+        value0 = self.get_value(*args, **kwargs)
+        grad = np.empty([len(vector)] + list(value0.shape), dtype=np.float64)
+        for i, v in enumerate(vector):
+            vector[i] = v + _EPS
+            self.set_parameter_vector(vector)
+            value = self.get_value(*args, **kwargs)
+            vector[i] = v
+            self.set_parameter_vector(vector)
+            grad[i] = (value - value0) / _EPS
+        return grad
+
+    def get_gradient(self, *args, **kwargs):
+        include_frozen = kwargs.pop("include_frozen", False)
+        g = self.compute_gradient(*args, **kwargs)
+        if include_frozen:
+            return g
+        return g[self.unfrozen_mask]
+
+    def __len__(self):
+        return self.vector_size
+
+    def _get_name(self, name_or_index):
+        try:
+            int(name_or_index)
+        except (TypeError, ValueError):
+            return name_or_index
+        return self.get_parameter_names()[int(name_or_index)]
+
+    def __getitem__(self, name_or_index):
+        return self.get_parameter(self._get_name(name_or_index))
+
+    def __setitem__(self, name_or_index, value):
+        return self.set_parameter(self._get_name(name_or_index), value)
+
+    @property
+    def full_size(self):
+        """The total number of parameters (including frozen parameters)"""
+        return len(self.parameter_names)
+
+    @property
+    def vector_size(self):
+        """The number of active (or unfrozen) parameters"""
+        return self.unfrozen_mask.sum()
+
+    @property
+    def parameter_vector(self):
+        """An array of all parameters (including frozen parameters)"""
+        return np.array([getattr(self, k) for k in self.parameter_names])
+
+    @parameter_vector.setter
+    def parameter_vector(self, v):
+        if len(v) != self.full_size:
+            raise ValueError("dimension mismatch")
+        for k, val in zip(self.parameter_names, v):
+            setattr(self, k, float(val))
+        self.dirty = True
+
+    def get_parameter_dict(self, include_frozen=False):
+        """
+        Get an ordered dictionary of the parameters
+
+        Args:
+            include_frozen (Optional[bool]): Should the frozen parameters be
+                included in the returned value? (default: ``False``)
+
+        """
+        return OrderedDict(zip(
+            self.get_parameter_names(include_frozen=include_frozen),
+            self.get_parameter_vector(include_frozen=include_frozen),
+        ))
+
+    def get_parameter_names(self, include_frozen=False):
+        """
+        Get a list of the parameter names
+
+        Args:
+            include_frozen (Optional[bool]): Should the frozen parameters be
+                included in the returned value? (default: ``False``)
+
+        """
+        if include_frozen:
+            return self.parameter_names
+        return tuple(p
+                     for p, f in zip(self.parameter_names, self.unfrozen_mask)
+                     if f)
+
+    def get_parameter_bounds(self, include_frozen=False):
+        """
+        Get a list of the parameter bounds
+
+        Args:
+            include_frozen (Optional[bool]): Should the frozen parameters be
+                included in the returned value? (default: ``False``)
+
+        """
+        if include_frozen:
+            return self.parameter_bounds
+        return list(p
+                    for p, f in zip(self.parameter_bounds, self.unfrozen_mask)
+                    if f)
+
+    def get_parameter_vector(self, include_frozen=False):
+        """
+        Get an array of the parameter values in the correct order
+
+        Args:
+            include_frozen (Optional[bool]): Should the frozen parameters be
+                included in the returned value? (default: ``False``)
+
+        """
+        if include_frozen:
+            return self.parameter_vector
+        return self.parameter_vector[self.unfrozen_mask]
+
+    def set_parameter_vector(self, vector, include_frozen=False):
+        """
+        Set the parameter values to the given vector
+
+        Args:
+            vector (array[vector_size] or array[full_size]): The target
+                parameter vector. This must be in the same order as
+                ``parameter_names`` and it should only include frozen
+                parameters if ``include_frozen`` is ``True``.
+            include_frozen (Optional[bool]): Should the frozen parameters be
+                included in the returned value? (default: ``False``)
+
+        """
+        v = self.parameter_vector
+        if include_frozen:
+            v[:] = vector
+        else:
+            v[self.unfrozen_mask] = vector
+        self.parameter_vector = v
+        self.dirty = True
+
+    def check_parameter_vector(self, vector):
+        # Save the original parameter vector and dirtiness
+        vector0 = np.array(self.get_parameter_vector())
+        dirty0 = self.dirty
+
+        # Update the vector and compute the prior
+        self.set_parameter_vector(vector)
+        lp = self.log_prior()
+
+        # Reset the parameter vector
+        self.set_parameter_vector(vector0)
+        self.dirty = dirty0
+        return np.isfinite(lp)
+
+    def freeze_parameter(self, name):
+        """
+        Freeze a parameter by name
+
+        Args:
+            name: The name of the parameter
+
+        """
+        i = self.get_parameter_names(include_frozen=True).index(name)
+        self.unfrozen_mask[i] = False
+
+    def thaw_parameter(self, name):
+        """
+        Thaw a parameter by name
+
+        Args:
+            name: The name of the parameter
+
+        """
+        i = self.get_parameter_names(include_frozen=True).index(name)
+        self.unfrozen_mask[i] = True
+
+    def freeze_all_parameters(self):
+        """Freeze all parameters of the model"""
+        self.unfrozen_mask[:] = False
+
+    def thaw_all_parameters(self):
+        """Thaw all parameters of the model"""
+        self.unfrozen_mask[:] = True
+
+    def get_parameter(self, name):
+        """
+        Get a parameter value by name
+
+        Args:
+            name: The name of the parameter
+
+        """
+        i = self.get_parameter_names(include_frozen=True).index(name)
+        return self.get_parameter_vector(include_frozen=True)[i]
+
+    def set_parameter(self, name, value):
+        """
+        Set a parameter value by name
+
+        Args:
+            name: The name of the parameter
+            value (float): The new value for the parameter
+
+        """
+        i = self.get_parameter_names(include_frozen=True).index(name)
+        v = self.get_parameter_vector(include_frozen=True)
+        v[i] = value
+        self.set_parameter_vector(v, include_frozen=True)
+
+    def log_prior(self):
+        """Compute the log prior probability of the current parameters"""
+        for p, b in zip(self.parameter_vector, self.parameter_bounds):
+            if b[0] is not None and p < b[0]:
+                return -np.inf
+            if b[1] is not None and p > b[1]:
+                return -np.inf
+        return 0.0
+
+    @staticmethod
+    def parameter_sort(f):
+        @wraps(f)
+        def func(self, *args, **kwargs):
+            values = f(self, *args, **kwargs)
+            names = self.get_parameter_names(include_frozen=True)
+            ret = [values[k] for k in names]
+            # Horrible hack to only return numpy array if that's what was
+            # given by the wrapped function.
+            if len(ret) and type(ret[0]).__module__ == np.__name__:
+                return np.vstack(ret)
+            return ret
+        return func
+
+
+class ModelSet(Model):
+    """
+    An abstract wrapper for combining named :class:`Model` objects
+
+    The parameter names of a composite model are prepended by the submodel
+    name. For example:
+
+    .. code-block:: python
+
+        model = ModelSet([
+            ("model1", Model(par1=1.0, par2=2.0)),
+            ("model2", Model(par3=3.0, par4=4.0)),
+        ])
+        print(model.get_parameter_names())
+
+    will print
+
+    .. code-block:: python
+
+        ["model1:par1", "model1:par2", "model2:par3", "model2:par4"]
+
+    Args:
+        models: This should be a list of the form: ``[("model1", Model(...)),
+            ("model2", Model(...)), ...]``.
+
+    """
+
+    def __init__(self, models):
+        self.models = OrderedDict()
+        for name, model in models:
+            self.models[name] = model
+
+    def __getattr__(self, name):
+        if "models" in self.__dict__ and name in self.models:
+            return self.models[name]
+        raise AttributeError(name)
+
+    @property
+    def dirty(self):
+        return any(m.dirty for m in self.models.values())
+
+    @dirty.setter
+    def dirty(self, value):
+        for m in self.models.values():
+            m.dirty = value
+
+    @property
+    def full_size(self):
+        return sum(m.full_size for m in self.models.values())
+
+    @property
+    def vector_size(self):
+        return sum(m.vector_size for m in self.models.values())
+
+    @property
+    def unfrozen_mask(self):
+        return np.concatenate([
+            m.unfrozen_mask for m in self.models.values()
+        ])
+
+    @property
+    def parameter_vector(self):
+        return np.concatenate([
+            m.parameter_vector for m in self.models.values()
+        ])
+
+    @parameter_vector.setter
+    def parameter_vector(self, v):
+        i = 0
+        for m in self.models.values():
+            l = m.full_size
+            m.parameter_vector = v[i:i+l]
+            i += l
+
+    @property
+    def parameter_names(self):
+        return tuple(chain(*(
+            map("{0}".format, m.parameter_names) if name is None else
+            map("{0}:{{0}}".format(name).format, m.parameter_names)
+            for name, m in self.models.items()
+        )))
+
+    @property
+    def parameter_bounds(self):
+        return list(chain(*(
+            m.parameter_bounds for m in self.models.values()
+        )))
+
+    def _apply_to_parameter(self, func, name, *args):
+        comp = name.split(":")
+        model_name = comp[0]
+        if model_name not in self.models:
+            if None in self.models:
+                model_name = None
+                comp = [None] + comp
             else:
-                any_ = True
-        if not any_:
-            raise ValueError("a method wrapped by 'parameter_sort' must "
-                             "return at least one dictionary with a key for "
-                             "each parameter in: {0}"
-                             .format(self.get_parameter_names()))
+                raise ValueError("unrecognized parameter '{0}'".format(name))
+        return getattr(self.models[model_name], func)(":".join(comp[1:]),
+                                                      *args)
 
-        return tuple(ret)
-    return func
+    def freeze_parameter(self, name):
+        self._apply_to_parameter("freeze_parameter", name)
+
+    def thaw_parameter(self, name):
+        self._apply_to_parameter("thaw_parameter", name)
+
+    def freeze_all_parameters(self):
+        for model in self.models.values():
+            model.freeze_all_parameters()
+
+    def thaw_all_parameters(self):
+        for model in self.models.values():
+            model.thaw_all_parameters()
+
+    def get_parameter(self, name):
+        return self._apply_to_parameter("get_parameter", name)
+
+    def set_parameter(self, name, value):
+        self.dirty = True
+        return self._apply_to_parameter("set_parameter", name, value)
+
+    def log_prior(self):
+        lp = 0.0
+        for model in self.models.values():
+            lp += model.log_prior()
+            if not np.isfinite(lp):
+                return -np.inf
+        return lp
+
+
+class ConstantModel(Model):
+    """
+    A simple concrete model with a single parameter ``value``
+
+    Args:
+        value (float): The value of the model.
+
+    """
+
+    parameter_names = ("value", )
+
+    def get_value(self, x):
+        return self.value + np.zeros(len(x))
+
+    def compute_gradient(self, x):
+        return np.ones((1, len(x)))
+
+
+class CallableModel(Model):
+
+    def __init__(self, function, gradient=None):
+        self.function = function
+        self.gradient = gradient
+        super(CallableModel, self).__init__()
+
+    def get_value(self, x):
+        return self.function(x)
+
+    def compute_gradient(self, x):
+        if self.gradient is not None:
+            return self.gradient(x)
+        return super(CallableModel, self).compute_gradient(x)
+
+
+def check_gradient(obj, *args, **kwargs):
+    quiet = kwargs.pop("quiet", False)
+    eps = kwargs.pop("eps", 1.23e-5)
+
+    grad0 = obj.get_gradient(*args, **kwargs)
+    vector = obj.get_parameter_vector()
+    for i, v in enumerate(vector):
+        # Compute the centered finite difference approximation to the gradient.
+        vector[i] = v + eps
+        obj.set_parameter_vector(vector)
+        p = obj.get_value(*args, **kwargs)
+
+        vector[i] = v - eps
+        obj.set_parameter_vector(vector)
+        m = obj.get_value(*args, **kwargs)
+
+        vector[i] = v
+        obj.set_parameter_vector(vector)
+
+        grad = 0.5 * (p - m) / eps
+        flag = np.allclose(grad0[i], grad)
+        msg = ("grad computation failed for '{0}' ({1})\n"
+               .format(obj.get_parameter_names()[i], i))
+        msg += "returned: {0}\ncomputed: {1}\n".format(grad0[i], grad)
+        msg += "delta: {0}".format(grad0[i] - grad)
+        if not flag:
+            if quiet:
+                print(msg)
+                return False
+            raise AssertionError(msg)
