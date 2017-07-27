@@ -11,6 +11,15 @@ try:
 except NameError:
     __MODELING_SETUP__ = False
 if not __MODELING_SETUP__:
+    # Deal with 'autograd' module import and deal with it if we don't have it
+    # installed
+    try:
+        import autograd  # NOQA
+    except ImportError:
+        HAS_AUTOGRAD = False
+    else:
+        HAS_AUTOGRAD = True
+
     import numpy as np
 
 __all__ = ["Model", "ModelSet", "ConstantModel", "CallableModel",
@@ -488,6 +497,27 @@ class ModelSet(Model):
             if not np.isfinite(lp):
                 return -np.inf
         return lp
+
+
+class AutoGradModel(Model):
+
+    def __init__(self, *args, **kwargs):
+        if not HAS_AUTOGRAD:
+            raise ImportError("the 'autograd' module must be installed to "
+                              "use the AutoGradModel")
+        self._grad_func = autograd.elementwise_grad(self.compute_value)
+        super(AutoGradModel, self).__init__(*args, **kwargs)
+
+    def compute_value(self, params, *args, **kwargs):
+        raise NotImplementedError("subclasses must implement this method")
+
+    def get_value(self, *args, **kwargs):
+        params = self.get_parameter_vector(include_frozen=True)
+        return self.compute_value(params, *args, **kwargs)
+
+    def compute_gradient(self, *args, **kwargs):
+        params = self.get_parameter_vector(include_frozen=True)
+        return self._grad_func(params, *args, **kwargs)
 
 
 class ConstantModel(Model):
